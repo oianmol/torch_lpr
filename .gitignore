@@ -1,0 +1,9 @@
+/output/
+/.venv/
+/debug_chars/
+/emnist_data/
+/plates_org/
+emnist_torchvision.pth
+/.idea/misc.xml
+/.idea/modules.xml
+/PyCharmMiscProject.iml
