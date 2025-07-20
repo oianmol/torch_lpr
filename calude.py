@@ -1,49 +1,27 @@
-import os
-import cv2
-import numpy as np
 import base64
 import datetime
 import logging
-import json
-import yaml
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any
+from typing import List, Tuple, Optional
 
-# --- TensorFlow Imports (Keep for TF model support if desired) ---
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 # --- PyTorch Imports ---
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF # Import functional for direct use
-
 from easyocr import Reader
-import warnings
-
-from ultralytics import YOLO
-import cv2
-import numpy as np
-from typing import List, Tuple, Optional
 
 # Suppress warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.get_logger().setLevel('ERROR')
 warnings.filterwarnings('ignore')  # General warnings filter
-
-# Configure GPU growth for TensorFlow if available
-try:
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logging.info(f"✅ Configured {len(gpus)} GPU(s) for dynamic memory growth (TensorFlow)")
-except Exception as e:
-    logging.warning(f"⚠️ TensorFlow GPU configuration failed: {e}")
 
 # Determine PyTorch device
 PYTORCH_DEVICE = torch.device("mps")
@@ -58,27 +36,25 @@ class ProcessingConfig:
     model_path: str = "emnist_cnn.h5"  # Could be .h5 or .pth
     output_dir: str = "output/"
     debug_dir: str = "debug_chars/"
-    num_classes: int = 0 # This should be set by the model loading now
+    num_classes: int = 0  # This should be set by the model loading now
     # Processing parameters
     batch_size: int = 32
     confidence_threshold: float = 0.7
     max_workers: int = 4
-
-
 
     # Image preprocessing
     adaptive_preprocessing: bool = True
     perspective_correction: bool = True
     noise_reduction: bool = True
 
-    # Character filtering
-    min_char_width: int = 8
-    min_char_height: int = 12
+    # Character filtering for single-row plates
+    min_char_width: int = 5
+    min_char_height: int = 8
     min_char_height_ratio: float = 0.1
     max_char_height_ratio: float = 0.8
     min_aspect_ratio: float = 0.15
     max_aspect_ratio: float = 1.2
-    min_char_area: int = 50
+    min_char_area: int = 100
 
     # OCR settings
     ocr_languages: List[str] = None
@@ -87,8 +63,6 @@ class ProcessingConfig:
     # Output settings
     generate_html: bool = True
     save_debug_images: bool = True
-    save_contour_images: bool = True # NEW: Option to save contour highlighted images
-
 
     def __post_init__(self):
         if self.ocr_languages is None:
@@ -149,12 +123,10 @@ class OptimizedPlateRecognizer:
 
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.yolo_model = YOLO("yolo11n-cls.pt")  # Use your trained YOLOv8 model
-        #results = self.yolo_model.train(data="mnist", epochs=100, imgsz=32)
         self.logger = self._setup_logging()
         self.model = None
         self.model_type = "UNKNOWN"
-        self.num_classes = config.num_classes # Initialized from config, updated by _load_model
+        self.num_classes = config.num_classes  # Initialized from config, updated by _load_model
         self.label_map = {}  # Store the correct label map based on model type
         self.ocr_reader = None
         self.pytorch_transform = transforms.Compose([
@@ -195,9 +167,7 @@ class OptimizedPlateRecognizer:
         directories = [
             self.config.output_dir,
             self.config.debug_dir,
-            Path(self.config.output_dir) / "reports",
-            Path(self.config.output_dir) / "json",
-            Path(self.config.output_dir) / "contour_images" # NEW: Directory for contour images
+            Path(self.config.output_dir) / "contour_images"  # NEW: Directory for contour images
         ]
 
         for directory in directories:
@@ -212,17 +182,11 @@ class OptimizedPlateRecognizer:
         model_ext = Path(self.config.model_path).suffix.lower()
 
         try:
-            if model_ext == '.h5':
-                self.model = load_model(self.config.model_path)
-                output_layer = self.model.layers[-1]
-                self.num_classes = output_layer.output.shape[-1]
-                self.model_backend = "keras"
-                self.logger.info(f"✅ Keras model loaded from {self.config.model_path}")
-
-            elif model_ext == '.pth':
-                if self.config.num_classes == 0: # Ensure num_classes is set for PyTorch model instantiation
-                    raise ValueError("config.num_classes must be set for PyTorch models (e.g., 47 for EMNIST_Balanced, 62 for EMNIST_ByClass).")
-                self.num_classes = self.config.num_classes # Use config's num_classes for PyTorch
+            if model_ext == '.pth':
+                if self.config.num_classes == 0:  # Ensure num_classes is set for PyTorch model instantiation
+                    raise ValueError(
+                        "config.num_classes must be set for PyTorch models (e.g., 47 for EMNIST_Balanced, 62 for EMNIST_ByClass).")
+                self.num_classes = self.config.num_classes  # Use config's num_classes for PyTorch
                 self.model = EMNISTCNN(self.num_classes)
                 self.model.load_state_dict(torch.load(self.config.model_path, map_location=PYTORCH_DEVICE))
                 self.model.eval()  # Set to evaluation mode
@@ -282,15 +246,7 @@ class OptimizedPlateRecognizer:
             return [], 0.0
 
         try:
-            if self.model_backend == "keras":
-                char_images_np = np.array(char_images_list).reshape(-1, 28, 28, 1).astype("float32") / 255.0
-                predictions = self.model.predict(char_images_np, verbose=0)
-
-                temperature = 1.5 if self.model_type.startswith("EMNIST") else 1.0
-                calibrated_preds = predictions / temperature
-                calibrated_preds = tf.nn.softmax(calibrated_preds).numpy()
-
-            elif self.model_backend == "pytorch":
+            if self.model_backend == "pytorch":
                 char_tensors = [self.pytorch_transform(img).float() for img in char_images_list]
                 batch_tensors = torch.stack(char_tensors).to(PYTORCH_DEVICE)
 
@@ -313,10 +269,166 @@ class OptimizedPlateRecognizer:
             self.logger.error(f"❌ Model prediction failed: {e}")
             return [], 0.0
 
+    def segment_digits_opencv_new(self, image_path: str) -> Tuple[
+        List[np.ndarray], List[Tuple[int, int, int, int]], Optional[np.ndarray]]:
+        """
+        OpenCV-based digit segmentation using contour detection with adaptive filtering.
+        """
+        image = cv2.imread(image_path)
+        if image is None:
+            self.logger.error(f"❌ Could not load image: {image_path}")
+            return [], [], None
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 31, 15
+        )
+
+        h_img, w_img = gray.shape
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Step 1 & 2: Collect all potential character candidates and their properties
+        candidate_boxes = []
+        candidate_props = []  # [(x, y, w, h), area, aspect_ratio]
+
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            aspect = w / float(h)
+
+            # Initial lenient filter: remove extremely small noise
+            if w > 2 and h > 2 and area > 10:  # Minimum pixel size
+                candidate_boxes.append((x, y, w, h))
+                candidate_props.append({'x': x, 'y': y, 'w': w, 'h': h, 'area': area, 'aspect': aspect})
+
+        if not candidate_props:
+            return [], [], image.copy()  # No valid candidates found
+
+        # Step 3: Analyze properties to find dominant character size
+        # Use a simple median or mode for robustness against outliers
+        # A more advanced approach could use clustering (e.g., DBSCAN or K-Means)
+        all_heights = [p['h'] for p in candidate_props]
+        all_widths = [p['w'] for p in candidate_props]
+        all_areas = [p['area'] for p in candidate_props]
+
+        # Calculate robust central tendencies
+        median_height = np.median(all_heights)
+        median_width = np.median(all_widths)
+        median_area = np.median(all_areas)
+        median_aspect = np.median([p['aspect'] for p in candidate_props if p['h'] != 0])
+
+        # Step 4: Derive dynamic thresholds based on medians
+        # Adjust these multipliers based on experimentation
+        dynamic_min_char_width = median_width * 0.5  # Allow some variance
+        dynamic_max_char_width = median_width * 1.5
+
+        dynamic_min_char_height = median_height * 0.5
+        dynamic_max_char_height = median_height * 1.5
+
+        dynamic_min_char_area = median_area * 0.4
+        dynamic_max_char_area = median_area * 2.0  # Allow for connected components
+
+        # Maintain existing global ratio checks as overall sanity checks
+        min_global_height_ratio = self.config.min_char_height_ratio * h_img
+        max_global_height_ratio = self.config.max_char_height_ratio * h_img
+
+        digit_boxes = []
+        digit_images = []
+        annotated = image.copy()
+
+        i = 0
+        for prop in candidate_props:
+            x, y, w, h = prop['x'], prop['y'], prop['w'], prop['h']
+            area = prop['area']
+            aspect = prop['aspect']
+
+            # Step 5: Re-filter using dynamic and global thresholds
+            if (
+                    area > dynamic_min_char_area and
+                    area < dynamic_max_char_area and  # Add max area to filter very large noise
+                    w >= dynamic_min_char_width and
+                    w <= dynamic_max_char_width and
+                    h >= dynamic_min_char_height and
+                    h <= dynamic_max_char_height and
+                    self.config.min_aspect_ratio < aspect < self.config.max_aspect_ratio and
+                    h >= min_global_height_ratio and  # Keep global min/max height ratios
+                    h <= max_global_height_ratio
+            ):
+                digit_crop = thresh[y:y + h, x:x + w]
+
+                # Square padding
+                size = max(w, h)
+                padded = np.zeros((size, size), dtype=np.uint8)
+                x_offset = (size - w) // 2
+                y_offset = (size - h) // 2
+                padded[y_offset:y_offset + h, x_offset:x_offset + w] = digit_crop
+                resized = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
+
+                digit_images.append(resized)
+                if self.config.save_debug_images:
+                    debug_path = Path(self.config.debug_dir) / f"{Path(image_path).stem}_char_{i}.png"
+                    cv2.imwrite(str(debug_path), resized)
+                digit_boxes.append((x, y, w, h))
+                i += 1
+                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 1)
+
+        # Smart sorting remains the same
+        # ... (Your existing sorting logic) ...
+        if digit_boxes:
+            # Group digits by row based on vertical overlap
+            digit_data = list(zip(digit_boxes, digit_images))
+
+            # Sort by y-coordinate first to group rows
+            digit_data.sort(key=lambda item: item[0][1])  # Sort by y
+
+            # Group into rows based on y-coordinate proximity
+            rows = []
+            current_row = []
+            tolerance = h_img * 0.1  # 10% of image height as tolerance
+
+            for box, img in digit_data:
+                x, y, w, h = box
+                center_y = y + h // 2
+
+                if not current_row:
+                    current_row.append((box, img))
+                else:
+                    # Check if this digit is in the same row as the last one
+                    last_center_y = current_row[-1][0][1] + current_row[-1][0][3] // 2
+                    if abs(center_y - last_center_y) <= tolerance:
+                        current_row.append((box, img))
+                    else:
+                        # Start a new row
+                        rows.append(current_row)
+                        current_row = [(box, img)]
+
+            if current_row:
+                rows.append(current_row)
+
+            # Sort each row left-to-right and combine
+            sorted_data = []
+            for row in rows:
+                row_sorted = sorted(row, key=lambda item: item[0][0])  # Sort by x
+                sorted_data.extend(row_sorted)
+
+            digit_boxes, digit_images = zip(*sorted_data)
+            digit_boxes, digit_images = list(digit_boxes), list(digit_images)
+        else:
+            digit_boxes, digit_images = [], []
+
+        if self.config.save_debug_images:
+            debug_path = Path(self.config.debug_dir) / f"{Path(image_path).stem}_contours.png"
+            cv2.imwrite(str(debug_path), annotated)
+            plt.imshow(annotated)
+            plt.show()
+        return list(digit_images), list(digit_boxes), annotated
+
     def segment_digits_opencv(self, image_path: str) -> Tuple[
         List[np.ndarray], List[Tuple[int, int, int, int]], Optional[np.ndarray]]:
         """
-        Improved OpenCV-based digit segmentation using contour detection.
+        Simplified OpenCV-based digit segmentation using contour detection.
         Returns:
             - List of 28x28 grayscale digit images
             - List of bounding boxes (x, y, w, h)
@@ -346,6 +458,7 @@ class OptimizedPlateRecognizer:
             x, y, w, h = cv2.boundingRect(cnt)
             area = w * h
             aspect = w / float(h)
+            print(f"Contour x,y ({x},{y})  w={w} h={h} area={area}")
             # Filter by area, aspect ratio, and height ratio
             if (
                     area > self.config.min_char_area and
@@ -355,6 +468,8 @@ class OptimizedPlateRecognizer:
                     h >= self.config.min_char_height
             ):
                 digit_crop = thresh[y:y + h, x:x + w]
+                print(f"Contour accepted {i} x,y ({x},{y})  w={w} h={h} area={area}")
+
                 # Square padding
                 size = max(w, h)
                 padded = np.zeros((size, size), dtype=np.uint8)
@@ -362,18 +477,63 @@ class OptimizedPlateRecognizer:
                 y_offset = (size - h) // 2
                 padded[y_offset:y_offset + h, x_offset:x_offset + w] = digit_crop
                 resized = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
+
                 digit_images.append(resized)
                 if self.config.save_debug_images:
                     debug_path = Path(self.config.debug_dir) / f"{Path(image_path).stem}_char_{i}.png"
                     cv2.imwrite(str(debug_path), resized)
                 digit_boxes.append((x, y, w, h))
                 i += 1
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 1)
 
-        # Sort digits left-to-right
-        digit_boxes, digit_images = zip(
-            *sorted(zip(digit_boxes, digit_images), key=lambda b: b[0][0])) if digit_images else ([], [])
+        # Smart sorting: handles both single and multiple rows automatically
+        if digit_boxes:
+            # Group digits by row based on vertical overlap
+            digit_data = list(zip(digit_boxes, digit_images))
 
+            # Sort by y-coordinate first to group rows
+            digit_data.sort(key=lambda item: item[0][1])  # Sort by y
+
+            # Group into rows based on y-coordinate proximity
+            rows = []
+            current_row = []
+            tolerance = h_img * 0.1  # 10% of image height as tolerance
+
+            for box, img in digit_data:
+                x, y, w, h = box
+                center_y = y + h // 2
+
+                if not current_row:
+                    current_row.append((box, img))
+                else:
+                    # Check if this digit is in the same row as the last one
+                    last_center_y = current_row[-1][0][1] + current_row[-1][0][3] // 2
+                    if abs(center_y - last_center_y) <= tolerance:
+                        current_row.append((box, img))
+                    else:
+                        # Start a new row
+                        rows.append(current_row)
+                        current_row = [(box, img)]
+
+            if current_row:
+                rows.append(current_row)
+
+            # Sort each row left-to-right and combine
+            sorted_data = []
+            for row in rows:
+                row_sorted = sorted(row, key=lambda item: item[0][0])  # Sort by x
+                sorted_data.extend(row_sorted)
+
+            digit_boxes, digit_images = zip(*sorted_data)
+            digit_boxes, digit_images = list(digit_boxes), list(digit_images)
+        else:
+            digit_boxes, digit_images = [], []
+
+        if self.config.save_debug_images:
+            debug_path = Path(self.config.debug_dir) / f"{Path(image_path).stem}_contours.png"
+            cv2.imwrite(str(debug_path), annotated)
+            plt.imshow(annotated)
+            plt.show()
         return list(digit_images), list(digit_boxes), annotated
 
     def process_single_image(self, image_path: str) -> Dict[str, Any]:
@@ -382,9 +542,9 @@ class OptimizedPlateRecognizer:
             filename = Path(image_path).name
             contour_img_b64 = ""
 
-            char_images, char_boxes, highlighted_img_np = self.segment_digits_opencv(image_path)
+            char_images, char_boxes, highlighted_img_np = self.segment_digits_opencv_new(image_path)
 
-            if highlighted_img_np is not None and self.config.save_contour_images:
+            if highlighted_img_np is not None:
                 _, img_encoded = cv2.imencode('.png', highlighted_img_np)
                 contour_img_b64 = f"data:image/png;base64,{base64.b64encode(img_encoded.tobytes()).decode('utf-8')}"
 
@@ -395,6 +555,7 @@ class OptimizedPlateRecognizer:
             if self.model is not None and char_images:
                 labels, conf = self.predict_with_confidence_calibration(char_images)
                 model_prediction = self.apply_license_plate_rules(''.join(labels))
+                print(f" output -> {model_prediction}")
                 model_confidence = conf
                 model_method = f"Model ({self.model_backend})"
 
@@ -465,7 +626,6 @@ class OptimizedPlateRecognizer:
                 "ocr_confidence": 0.0,
                 "ocr_method": "",
             }
-
 
     def process_images_batched(self) -> Dict[str, Any]:
         """Process images in batches with multithreading"""
@@ -725,7 +885,7 @@ class OptimizedPlateRecognizer:
     </html>"""
 
         html_path = Path(
-            self.config.output_dir) / "reports" / f"plate_recognition_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            self.config.output_dir) / f"plate_recognition.html"
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
@@ -756,10 +916,7 @@ class OptimizedPlateRecognizer:
 
     def _generate_model_info_html(self) -> str:
         """Generate model information HTML section"""
-        if self.model_backend == "keras":
-            backend_info = "Keras/TensorFlow"
-            backend_style = "background-color: #d4edda; border: 1px solid #c3e6cb;"
-        elif self.model_backend == "pytorch":
+        if self.model_backend == "pytorch":
             backend_info = "PyTorch"
             backend_style = "background-color: #cce5ff; border: 1px solid #b8daff;"
         else:
@@ -808,16 +965,10 @@ class OptimizedPlateRecognizer:
 
 
 if __name__ == "__main__":
-    # Example Usage:
-    # To use a Keras model (e.g., emnist_cnn.h5)
-    # config = ProcessingConfig(model_path="emnist_cnn.h5", num_classes=62) # Set num_classes for your model
-
-    # To use a PyTorch model (e.g., emnist_cnn_pytorch.pth)
     config = ProcessingConfig(
         model_path="emnist_torchvision.pth",
-        num_classes=36, # IMPORTANT: Set this to 47 for EMNIST_Balanced, 62 for EMNIST_ByClass, etc.
-        image_dir="plates_org/test/", # Example directory
-        save_contour_images=True # Enable saving contour images
+        num_classes=36,  # IMPORTANT: Set this to 47 for EMNIST_Balanced, 62 for EMNIST_ByClass, etc.
+        image_dir="plates_org/test/",  # Example directory
     )
 
     recognizer = OptimizedPlateRecognizer(config)
