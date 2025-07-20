@@ -269,6 +269,41 @@ class OptimizedPlateRecognizer:
             self.logger.error(f"❌ Model prediction failed: {e}")
             return [], 0.0
 
+    def square_pad_resize(self, digit_crop: np.ndarray, output_size=28, vpad_ratio=0.2) -> np.ndarray:
+        """
+        Adds vertical padding and resizes to output_size x output_size.
+        - vpad_ratio: % of character height to add as vertical margin (default 20%)
+        """
+        # Step 1: Tight bounding
+        coords = cv2.findNonZero(digit_crop)
+        if coords is None:
+            return np.zeros((output_size, output_size), dtype=np.uint8)
+
+        x, y, w, h = cv2.boundingRect(coords)
+        digit_crop = digit_crop[y:y + h, x:x + w]
+
+        # Step 2: Add vertical margin (top & bottom)
+        vpad = int(h * vpad_ratio)
+        padded = cv2.copyMakeBorder(
+            digit_crop,
+            top=vpad,
+            bottom=vpad,
+            left=0,
+            right=0,
+            borderType=cv2.BORDER_CONSTANT,
+            value=0
+        )
+
+        # Step 3: Square pad to ensure equal width and height
+        new_h, new_w = padded.shape
+        size = max(new_w, new_h)
+        square = np.zeros((size, size), dtype=np.uint8)
+        x_offset = (size - new_w) // 2
+        y_offset = (size - new_h) // 2
+        square[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = padded
+
+        # Step 4: Resize to 28x28
+        return cv2.resize(square, (output_size, output_size), interpolation=cv2.INTER_AREA)
     def segment_digits_opencv_new(self, image_path: str) -> Tuple[
         List[np.ndarray], List[Tuple[int, int, int, int]], Optional[np.ndarray]]:
         """
@@ -358,13 +393,12 @@ class OptimizedPlateRecognizer:
             ):
                 digit_crop = thresh[y:y + h, x:x + w]
 
+                #plt.imshow(digit_crop)
+                #plt.show()
                 # Square padding
-                size = max(w, h)
-                padded = np.zeros((size, size), dtype=np.uint8)
-                x_offset = (size - w) // 2
-                y_offset = (size - h) // 2
-                padded[y_offset:y_offset + h, x_offset:x_offset + w] = digit_crop
-                resized = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
+                resized = self.square_pad_resize(digit_crop)
+                #plt.imshow(resized)
+                #plt.show()
 
                 digit_images.append(resized)
                 if self.config.save_debug_images:
@@ -421,8 +455,8 @@ class OptimizedPlateRecognizer:
         if self.config.save_debug_images:
             debug_path = Path(self.config.debug_dir) / f"{Path(image_path).stem}_contours.png"
             cv2.imwrite(str(debug_path), annotated)
-            plt.imshow(annotated)
-            plt.show()
+            #plt.imshow(annotated)
+            #plt.show()
         return list(digit_images), list(digit_boxes), annotated
 
     def segment_digits_opencv(self, image_path: str) -> Tuple[
@@ -968,7 +1002,7 @@ if __name__ == "__main__":
     config = ProcessingConfig(
         model_path="emnist_torchvision.pth",
         num_classes=36,  # IMPORTANT: Set this to 47 for EMNIST_Balanced, 62 for EMNIST_ByClass, etc.
-        image_dir="plates_org/test/",  # Example directory
+        image_dir="plates_org/",  # Example directory
     )
 
     recognizer = OptimizedPlateRecognizer(config)
